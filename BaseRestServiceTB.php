@@ -1,13 +1,13 @@
 <?php
 
-require(dirname(__FILE__) . '/RestServiceTB.php');
+require(dirname(__FILE__) . '/Route.php');
 
 /*
  * Base class for REST services
  * @author mathias@tela-botanica.org
- * @date 08/2015
+ * @date 08/2015, 02/2020
  */
-abstract class BaseRestServiceTB implements RestServiceTB {
+abstract class BaseRestServiceTB {
 
 	/** Configuration given at construct time */
 	protected $config;
@@ -33,6 +33,9 @@ abstract class BaseRestServiceTB implements RestServiceTB {
 	/** First resource separator (to parse resources) */
 	protected $firstResourceSeparator;
 
+	/** List of registered Route objects, for each HTTP verb */
+	protected $routes;
+
 	public function __construct($config) {
 		$this->config = $config;
 
@@ -50,58 +53,112 @@ abstract class BaseRestServiceTB implements RestServiceTB {
 			$this->firstResourceSeparator = $this->config['first_resource_separator'];
 		}
 
+		$this->routes = [
+			"GET" => [],
+			"POST" => [],
+			"PUT" => [],
+			"PATCH" => [],
+			"DELETE" => [],
+			"OPTIONS" => []
+		];
+
 		// initialization
+		$this->routes();
 		$this->getResources();
 		$this->getParams();
 
 		$this->init();
 	}
 
-  /**
-	 * Responds to an HTTP request issued with the GET method/verb.
-	 * Returns the JSON representation of a single resource (or of all resources)
-	 * depending on wether the resource ID is provided in the URL path (or not).
-	 */
-	abstract protected function get();
-
-	/**
-	 * Responds to an HTTP request issued with the POST method/verb.
-	 * Creates a new resource built using the POST parameters passed.
-	 */
-	abstract protected function post();
-
-	/**
-	 * Responds to an HTTP request issued with the PUT method/verb.
-	 * Updates all parameters of the resource identified by the ID provided in
-	 * the URL path if it exists (using the parameters passed). Responds with a
-	 * 404 HTTP response if not.
-	 */
-	abstract protected function put();
-
-	/**
-	 * Responds to an HTTP request issued with the PATCH method/verb.
-	 * Updates parts of the parameters of the resource identified by the ID
-	 * provided in the URL path if it exists  (using the parameters passed).
-	 * Responds with a 404 HTTP response if not.
-	 */
-	abstract protected function patch();
-
-	/**
-	 * Responds to an HTTP request issued with the DELETE method/verb.
-	 * Removes the resource identified by the ID provided in the URL path if it
-	 * exists. Responds with a 404 HTTP response if not.
-	 */
-	abstract protected function delete();
-
-	/**
-	 * Responds to an HTTP request issued with the OPTIONS method/verb.
-	 * Responds with a 200 status with an 'Allow' header listing the HTTP methods
-	 * that may be used on this resource.
-	 */
-	abstract protected function options();
+	/** Define your routes here by calling $this->get(), $this->post(), … */
+	protected abstract function routes();
 
 	/** Post-constructor adjustments */
 	protected function init() {
+	}
+
+	/**
+	 * Adds a route
+	 * 
+	 * @param string $httpVerb the HTTP verb to bind the route to
+	 * @param string $scheme
+	 * @param callable $function
+	 */
+	protected function addRoute($httpVerb, $scheme, $function) {
+		if (! in_array($httpVerb, array_keys($this->routes))) {
+			throw new Exception("unsupported method: $httpVerb");
+		}
+		array_push($this->routes[$httpVerb], new Route($scheme, $function));
+		$this->sortRoutes($httpVerb);
+	}
+
+	/** adds a route for GET HTTP verb */
+	protected function get($scheme, $function) {
+		$this->addRoute("GET", $scheme, $function);
+	}
+
+	/** adds a route for POST HTTP verb */
+	protected function post($scheme, $function) {
+		$this->addRoute("POST", $scheme, $function);
+	}
+
+	/** adds a route for PUT HTTP verb */
+	protected function put($scheme, $function) {
+		$this->addRoute("PUT", $scheme, $function);
+	}
+
+	/** adds a route for PATCH HTTP verb */
+	protected function patch($scheme, $function) {
+		$this->addRoute("PATCH", $scheme, $function);
+	}
+
+	/** adds a route for DELETE HTTP verb */
+	protected function delete($scheme, $function) {
+		$this->addRoute("DELETE", $scheme, $function);
+	}
+
+	/** adds a route for OPTIONS HTTP verb @WARNING might break CORS */
+	protected function options($scheme, $function) {
+		$this->addRoute("OPTIONS", $scheme, $function);
+	}
+
+	/**
+	 * Sorts routes for a given HTTP verb, so that the most "complex"
+	 * routes are found first
+	 */
+	protected function sortRoutes($httpVerb) {
+		usort($this->routes[$httpVerb], function ($a, $b) {
+			// 1. more URI scheme parts -> better rank
+        	$aParts = Route::extractSchemeParts($a->scheme);
+        	$bParts = Route::extractSchemeParts($b->scheme);
+			if (count($aParts) < count($bParts)) {
+				return 1;
+			} elseif (count($aParts) > count($bParts)) {
+				return -1;
+			} else {
+				// 2. more URI scheme parameters -> better rank
+				$aParams = 0;
+				foreach ($aParts as $ap) {
+					if (substr($ap, 0, 1) === ":") {
+						$aParams++;
+					}
+				}
+				$bParams = 0;
+				foreach ($bParts as $bp) {
+					if (substr($bp, 0, 1) === ":") {
+						$bParams++;
+					}
+				}
+				if ($aParams < $bParams) {
+					return 1;
+				} elseif ($aParams > $bParams) {
+					return -1;
+				} else {
+					// 3. lexicographical order
+					return strcasecmp($a->scheme, $b->scheme);
+				}
+			}
+		});
 	}
 
 	/**
@@ -109,33 +166,27 @@ abstract class BaseRestServiceTB implements RestServiceTB {
 	 * exceptions and turns them into HTTP errors with message
 	 */
 	public function run() {
-		try {
-			switch($this->verb) {
-				case "GET":
-					$this->get();
+		if (! in_array($this->verb, array_keys($this->routes))) {
+			$this->sendError("unsupported method: $this->verb");
+		}
+		$routeFound = false;
+		foreach ($this->routes[$this->verb] as $route) {
+			if ($route->matches($this->resources)) {
+				$routeFound = true;
+				try {
+					$response = $route->run($this->resources);
+					if ($response !== null) {
+						$this->sendJson($response);
+					}
 					break;
-				case "POST":
-					$this->post();
-					break;
-				case "PUT":
-					$this->put();
-					break;
-				case "PATCH":
-					$this->patch();
-					break;
-				case "DELETE":
-					$this->delete();
-					break;
-				case "OPTIONS":
-					// @WARNING will break CORS if you implement it
-					$this->options();
-					break;
-				default:
-					$this->sendError("unsupported method: $this->verb");
+				} catch(Exception $e) {
+					// catches lib exceptions and turns them into error 500
+					$this->sendError($e->getMessage(), 500);
+				}
 			}
-		} catch(Exception $e) {
-			// catches lib exceptions and turns them into error 500
-			$this->sendError($e->getMessage(), 500);
+		}
+		if (! $routeFound) {
+			$this->sendError("no {$this->verb} route matching the given URI");
 		}
 	}
 
@@ -144,7 +195,7 @@ abstract class BaseRestServiceTB implements RestServiceTB {
 	 * @param type $json the message
 	 * @param type $code defaults to 200 (HTTP OK)
 	 */
-	protected function sendJson($json, $code=200) {
+	public function sendJson($json, $code=200) {
 		header('Content-type: application/json');
 		http_response_code($code);
 		echo json_encode($json, JSON_UNESCAPED_UNICODE);
@@ -156,7 +207,7 @@ abstract class BaseRestServiceTB implements RestServiceTB {
 	 * @param type $error a string explaining the reason for this error
 	 * @param type $code defaults to 400 (HTTP Bad Request)
 	 */
-	protected function sendError($error, $code=400) {
+	public function sendError($error, $code=400) {
 		header('Content-type: application/json');
 		http_response_code($code);
 		echo json_encode(array("error" => $error));
@@ -224,6 +275,9 @@ abstract class BaseRestServiceTB implements RestServiceTB {
 		return $contents;
 	}
 
+	/**
+	 * Sends the $file file for progressive download
+	 */
 	protected function sendFile($file, $name, $size, $mimetype='application/octet-stream') {
 		if (! file_exists($file)) {
 			$this->sendError("file does not exist");
